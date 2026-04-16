@@ -1,0 +1,497 @@
+import React, { useEffect, useRef, useState } from "react";
+import {
+  Clock3,
+  Download,
+  Grid3X3,
+  Loader2,
+  PanelsTopLeft,
+  Sparkles,
+  Trash2,
+  Upload,
+  WandSparkles,
+  X,
+  MousePointer2,
+  Settings2,
+  Key,
+  ShieldCheck
+} from "lucide-react";
+
+// --- Types ---
+type GeoMode = "geometry" | "3d";
+
+type GeoGebraApi = {
+  evalCommand: (command: string) => boolean;
+  getAllObjectNames: () => string[];
+  getObjectType: (name: string) => string;
+  setLineThickness: (name: string, thickness: number) => void;
+  setColor: (name: string, r: number, g: number, b: number) => void;
+  setVisible: (name: string, visible: boolean) => void;
+  setLabelVisible: (name: string, visible: boolean) => void;
+  setPointStyle: (name: string, style: number) => void;
+  setPointSize: (name: string, size: number) => void;
+  setFilling?: (name: string, filling: number) => void;
+  setBase64?: (base64: string) => void;
+  getBase64?: ((callback?: (base64: string) => void) => string | void) | undefined;
+  getValue: (name: string) => number;
+  newConstruction: () => void;
+  setSize?: (width: number, height: number) => void;
+  recalculateEnvironments?: () => void;
+  showGrid?: (visible: boolean) => void;
+};
+
+type GeoGebraAiResponse = {
+  commands?: string[];
+  summary?: string;
+};
+
+type HistoryItem = {
+  id: string;
+  prompt: string;
+  createdAt: number;
+};
+
+// --- Inlined UI Components ---
+const Card = ({ children, className = "" }: { children: React.ReactNode; className?: string }) => (
+  <div className={`bg-white rounded-[2rem] shadow-xl border border-slate-200 overflow-hidden ${className}`}>
+    {children}
+  </div>
+);
+
+const CardHeader = ({ children, className = "" }: { children: React.ReactNode; className?: string }) => (
+  <div className={`p-6 pb-4 ${className}`}>{children}</div>
+);
+
+const CardTitle = ({ children, className = "" }: { children: React.ReactNode; className?: string }) => (
+  <h2 className={`text-lg font-black text-slate-800 tracking-tight flex items-center gap-2 ${className}`}>{children}</h2>
+);
+
+const CardContent = ({ children, className = "" }: { children: React.ReactNode; className?: string }) => (
+  <div className={`p-6 pt-0 ${className}`}>{children}</div>
+);
+
+const Button = ({ children, onClick, disabled, variant = "default", className = "" }: any) => {
+  const variants: any = {
+    default: "bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200 shadow-lg",
+    outline: "border border-slate-200 text-slate-700 hover:bg-slate-50",
+    ghost: "text-slate-600 hover:bg-slate-100",
+    destructive: "bg-red-50 text-red-600 hover:bg-red-100",
+  };
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`px-6 py-3 rounded-2xl text-sm font-black transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 active:scale-95 ${variants[variant]} ${className}`}
+    >
+      {children}
+    </button>
+  );
+};
+
+// --- Constants ---
+const GEOGEBRA_SCRIPT_SRC = "https://www.geogebra.org/apps/deployggb.js";
+const HISTORY_STORAGE_KEY = "geogebra_ai_pro_v11_history";
+const API_KEY_STORAGE_KEY = "geogebra_gemini_api_key";
+
+// --- API Logic ---
+async function fetchGeminiAI(userPrompt: string, systemPrompt: string, apiKey: string): Promise<GeoGebraAiResponse> {
+  if (!apiKey) throw new Error("Vui lòng nhập Gemini API Key ở mục cấu hình.");
+  
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+  
+  const payload = {
+    contents: [{ parts: [{ text: userPrompt }] }],
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    generationConfig: { 
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          commands: { type: "ARRAY", items: { type: "STRING" } },
+          summary: { type: "STRING" }
+        },
+        required: ["commands"]
+      }
+    }
+  };
+
+  const makeRequest = async () => {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error?.message || `API Error: ${response.status}`);
+    }
+    const result = await response.json();
+    const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) throw new Error("AI không trả về kết quả.");
+    return JSON.parse(text);
+  };
+
+  let delayTime = 1000;
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await makeRequest();
+    } catch (err) {
+      if (i === 2) throw err;
+      await new Promise(resolve => setTimeout(resolve, delayTime));
+      delayTime *= 2;
+    }
+  }
+  throw new Error("Mất kết nối với dịch vụ AI.");
+}
+
+// --- HYPER-VALIDATOR ENGINE v11.0 ---
+function hyperValidator(commands: string[]) {
+  if (!Array.isArray(commands)) return [];
+  
+  return commands
+    .map((raw) => {
+      let fixed = String(raw || "").trim();
+      
+      // 1. Boolean True/False -> true/false
+      fixed = fixed.replace(/\[\s*True\s*\]/g, "[true]")
+                   .replace(/\[\s*False\s*\]/g, "[false]")
+                   .replace(/,\s*True\s*([\]\),])/g, ", true$1")
+                   .replace(/,\s*False\s*([\]\),])/g, ", false$1");
+
+      // 2. Chặn đặt tên đối tượng trùng với hệ thống
+      const reservedNames = ["TrucTung", "TrucHuanh", "yAxis", "xAxis", "zAxis", "O", "f", "g", "h"];
+      reservedNames.forEach(name => {
+        const regex = new RegExp(`^${name}\\s*=`, "i");
+        if (regex.test(fixed)) {
+           fixed = fixed.replace(regex, `obj_${name}_${Math.floor(Math.random()*100)}=`);
+        }
+      });
+
+      // 3. Triệt tiêu mảnh vụn rác 1 ký tự
+      if (!fixed || /^[a-zA-Z]$/.test(fixed) || /^(?:f\(x\)|h\(x\)|z\(x\)|r)$/i.test(fixed)) {
+        return "// SCRAPPED";
+      }
+
+      // 4. Dịch thuật lệnh Việt-Anh
+      const dictionary: Record<string, string> = {
+        Neu: "If", Nếu: "If", HamSo: "Function", HàmSố: "Function",
+        GiaoDiem: "Intersect", GiaoĐiểm: "Intersect", DaGiac: "Polygon",
+        DoanThang: "Segment", MatCong: "Surface", Tron: "Circle", ThucHien: "Execute"
+      };
+      Object.entries(dictionary).forEach(([vn, en]) => {
+        if (fixed.toLowerCase().startsWith(vn.toLowerCase())) {
+          fixed = fixed.replace(new RegExp(`^${vn}`, "i"), en);
+        }
+      });
+
+      // 5. Chuẩn hóa ngoặc vuông [ ]
+      const ggbStandard = ["Polygon", "Segment", "Vector", "Text", "Function", "Circle", "Surface", "SetColor", "If", "Intersect", "Point", "Sphere", "Execute", "ShowAxes", "ShowGrid"];
+      ggbStandard.forEach((name) => {
+        const regex = new RegExp(`^${name}\\((.*)\\)$`, "i");
+        const match = fixed.match(regex);
+        if (match) fixed = `${name}[${match[1]}]`;
+      });
+
+      return fixed;
+    })
+    .filter((c) => c && !c.startsWith("//"));
+}
+
+export default function App() {
+  const appletContainerRef = useRef<HTMLDivElement | null>(null);
+  const [mode, setMode] = useState<GeoMode>("geometry");
+  const [scriptReady, setScriptReady] = useState(false);
+  const [query, setQuery] = useState("");
+  const [lineThickness, setLineThickness] = useState(3);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [lastSummary, setLastSummary] = useState("Vui lòng cấu hình API Key và nhập yêu cầu.");
+  const [engineStatus, setEngineStatus] = useState("Khởi tạo...");
+  const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
+  const [userApiKey, setUserApiKey] = useState("");
+
+  useEffect(() => {
+    const existing = document.getElementById("ggb-script");
+    if (!existing) {
+      const script = document.createElement("script");
+      script.id = "ggb-script";
+      script.src = GEOGEBRA_SCRIPT_SRC;
+      script.async = true;
+      script.onload = () => setScriptReady(true);
+      document.body.appendChild(script);
+    } else {
+      setScriptReady(true);
+    }
+    
+    // Load history and API key from localStorage
+    const rawHistory = localStorage.getItem(HISTORY_STORAGE_KEY);
+    if (rawHistory) setHistoryItems(JSON.parse(rawHistory));
+    
+    const savedKey = localStorage.getItem(API_KEY_STORAGE_KEY);
+    if (savedKey) setUserApiKey(savedKey);
+  }, []);
+
+  useEffect(() => {
+    if (scriptReady && appletContainerRef.current) {
+      initApplet();
+    }
+  }, [scriptReady, mode]);
+
+  const saveApiKey = (key: string) => {
+    setUserApiKey(key);
+    localStorage.setItem(API_KEY_STORAGE_KEY, key);
+  };
+
+  const initApplet = () => {
+    if (!window.GGBApplet || !appletContainerRef.current) return;
+    appletContainerRef.current.innerHTML = '<div id="ggb-element" style="width:100%; height:720px;"></div>';
+    const params = {
+      appName: mode === "geometry" ? "classic" : "3d",
+      width: appletContainerRef.current.clientWidth || 800,
+      height: 720,
+      showToolBar: true,
+      showAlgebraInput: true,
+      language: "vi",
+      appletOnLoad: () => {
+        setEngineStatus(`${mode.toUpperCase()} đã sẵn sàng.`);
+        const api = window.ggbApplet;
+        if (api) {
+          const perspective = mode === "geometry" ? "AG" : "T";
+          api.evalCommand(`SetPerspective["${perspective}"]`);
+          api.evalCommand("ShowAxes[true]");
+          api.evalCommand("ShowGrid[true]");
+        }
+      },
+    };
+    const applet = new window.GGBApplet(params, true);
+    applet.inject("ggb-element");
+  };
+
+  const runAiGeneration = async (inputPrompt: string) => {
+    if (!inputPrompt.trim()) return;
+    if (!userApiKey) {
+        setLastSummary("LỖI: Bạn chưa nhập Gemini API Key ở cột bên trái.");
+        return;
+    }
+
+    setIsGenerating(true);
+    setEngineStatus("AI đang phân tích yêu cầu...");
+
+    try {
+      const is3D = /(khối|3d|không gian|chiều cao|z\s*=)/i.test(inputPrompt);
+      if (is3D && mode !== "3d") {
+        setMode("3d");
+        await new Promise(r => setTimeout(r, 1200));
+      }
+
+      const systemPrompt = `CHỈ THỊ VẼ HÌNH v11.0:
+1. TOÁN HỌC TỌA ĐỘ: Tính toán đỉnh bằng cos, sin. VD Ngôi sao 5 cánh: Pk = (R*cos(90+k*144), R*sin(90+k*144)).
+2. LỖI BOOLEAN: Tuyệt đối dùng "true"/"false" (chữ thường). Cấm dùng "True"/"False".
+3. TÊN ĐỐI TƯỢNG: Tránh dùng tên TrucTung, TrucHuanh, x, y. Hãy dùng tên như pt1, pt2, L1...
+4. RÀNG BUỘC 3D: Mặt cong h(x,y) phải dùng If[x^2+y^2 <= R^2, h] để không bị tràn.
+5. CẤM FRAGMENT: Không trả biến lẻ 'f', 'z'.
+HỢP ĐỒNG: Trả về JSON { "commands": ["Lệnh"], "summary": "Mô tả" }.`;
+
+      const response = await fetchGeminiAI(inputPrompt, systemPrompt, userApiKey);
+      const commands = hyperValidator(response.commands || []);
+
+      const api = window.ggbApplet;
+      if (api && commands.length > 0) {
+        commands.forEach(cmd => {
+          try { api.evalCommand(cmd); } catch (e) {}
+        });
+        
+        setTimeout(() => {
+          api.getAllObjectNames().forEach(name => {
+            const type = api.getObjectType(name);
+            if (type === "point") {
+              api.evalCommand(`SetLabelMode[${name}, 0]`);
+              if (name.length > 1 && !/^[A-Z]$/.test(name)) api.setVisible(name, false);
+            }
+            if (["polygon", "surface"].includes(type)) api.evalCommand(`SetFilling[${name}, 0.4]`);
+            if (["line", "segment", "function", "curve", "vector"].includes(type)) {
+              api.setLineThickness(name, lineThickness);
+            }
+          });
+          api.recalculateEnvironments?.();
+        }, 600);
+
+        setLastSummary(String(response.summary || "Đã vẽ hoàn thành."));
+        const newItem = { id: Date.now().toString(), prompt: inputPrompt, createdAt: Date.now() };
+        setHistoryItems(prev => [newItem, ...prev.filter(h => h.prompt !== inputPrompt)].slice(0, 20));
+        localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify([newItem, ...historyItems].slice(0, 20)));
+      }
+    } catch (error) {
+      setLastSummary(`Lỗi hệ thống: ${String(error)}`);
+    } finally {
+      setIsGenerating(false);
+      setEngineStatus("Sẵn sàng.");
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 p-4 md:p-8 flex flex-col gap-8 font-sans">
+      <header className="flex flex-col lg:flex-row lg:items-center justify-between bg-white p-5 rounded-[2.5rem] shadow-sm border border-slate-200 gap-6">
+        <div className="flex items-center gap-4">
+          <div className="bg-indigo-600 p-3 rounded-2xl text-white shadow-lg shadow-indigo-100">
+            <WandSparkles className="h-7 w-7" />
+          </div>
+          <div>
+            <h1 className="text-2xl font-black text-slate-800 tracking-tight">GeoGebra Master Studio</h1>
+            <div className="flex items-center gap-2">
+               <span className={`h-2.5 w-2.5 rounded-full ${scriptReady ? 'bg-emerald-500' : 'bg-amber-500 animate-pulse'}`} />
+               <p className="text-[10px] uppercase tracking-[0.2em] text-slate-400 font-black">v11.0 Hyper-Validator • {engineStatus}</p>
+            </div>
+          </div>
+        </div>
+        <div className="flex bg-slate-100 p-1.5 rounded-2xl shadow-inner shrink-0">
+           <button 
+             onClick={() => setMode("geometry")} 
+             className={`px-8 py-2.5 rounded-xl text-xs font-black transition-all ${mode === "geometry" ? "bg-white text-indigo-600 shadow-md" : "text-slate-500 hover:text-slate-700"}`}
+           >2D VIEW</button>
+           <button 
+             onClick={() => setMode("3d")} 
+             className={`px-8 py-2.5 rounded-xl text-xs font-black transition-all ${mode === "3d" ? "bg-white text-indigo-600 shadow-md" : "text-slate-500 hover:text-slate-700"}`}
+           >3D VIEW</button>
+        </div>
+      </header>
+
+      <div className="grid gap-8 lg:grid-cols-[400px_1fr]">
+        <aside className="flex flex-col gap-8">
+          {/* Cấu hình API Key */}
+          <Card className="border-indigo-100 bg-indigo-50/20">
+            <CardHeader>
+              <div className="flex items-center gap-2 mb-1">
+                <Key className="h-4 w-4 text-indigo-600" />
+                <span className="text-[11px] font-black uppercase text-indigo-900 tracking-widest">Cấu hình API Gemini</span>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-4">
+               <div className="relative group">
+                 <input 
+                   type="password"
+                   value={userApiKey}
+                   onChange={(e) => saveApiKey(e.target.value)}
+                   placeholder="Dán Gemini API Key tại đây..."
+                   className="w-full p-4 rounded-2xl border-2 border-indigo-100 bg-white focus:border-indigo-500 outline-none transition-all text-xs font-mono"
+                 />
+                 <div className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-300">
+                    {userApiKey ? <ShieldCheck className="h-4 w-4 text-emerald-500" /> : <Settings2 className="h-4 w-4" />}
+                 </div>
+               </div>
+               <p className="text-[9px] text-slate-400 font-bold uppercase tracking-tighter leading-tight italic px-1">
+                 * Key được lưu an toàn trên trình duyệt của bạn (localStorage).
+               </p>
+            </CardContent>
+          </Card>
+
+          <Card className="border-indigo-100">
+            <CardHeader className="bg-indigo-50/30">
+              <div className="flex items-center gap-2 mb-1">
+                <Sparkles className="h-4 w-4 text-indigo-500" />
+                <span className="text-[11px] font-black uppercase text-indigo-900 tracking-widest">Trợ lý vẽ AI</span>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-6 pt-6">
+              <textarea
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="VD: Vẽ ngôi sao năm cánh, đồ thị hàm số y = sin(x)..."
+                className="w-full min-h-[160px] p-5 rounded-3xl border-2 border-slate-100 bg-slate-50 focus:bg-white focus:ring-8 focus:ring-indigo-500/5 focus:border-indigo-50 outline-none transition-all text-sm font-bold"
+              />
+
+              <div className="space-y-4 px-1">
+                 <div className="flex justify-between items-center">
+                   <span className="text-[10px] font-black uppercase text-slate-400">Độ dày nét</span>
+                   <span className="text-indigo-600 font-black text-xs bg-indigo-50 px-3 py-1 rounded-lg">{lineThickness} px</span>
+                 </div>
+                 <input 
+                   type="range" min="1" max="13" value={lineThickness} 
+                   onChange={(e) => setLineThickness(parseInt(e.target.value))}
+                   className="w-full h-2 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                 />
+              </div>
+
+              <Button 
+                onClick={() => void runAiGeneration(query)} 
+                disabled={isGenerating || !scriptReady} 
+                className="w-full h-16 rounded-[24px]"
+              >
+                {isGenerating ? <Loader2 className="animate-spin h-6 w-6" /> : <WandSparkles className="h-6 w-6" />}
+                XỬ LÝ VÀ VẼ HÌNH
+              </Button>
+            </CardContent>
+          </Card>
+
+          <Card className="flex-1 flex flex-col min-h-[300px]">
+            <CardHeader className="flex flex-row items-center justify-between border-b border-slate-50 pb-5 px-6">
+              <div className="flex items-center gap-2">
+                <Clock3 className="h-4 w-4 text-slate-400" />
+                <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Lịch sử bản vẽ</span>
+              </div>
+              <button 
+                onClick={() => { setHistoryItems([]); localStorage.removeItem(HISTORY_STORAGE_KEY); }} 
+                className="text-[9px] font-bold text-red-400 hover:text-red-600"
+              >XÓA HẾT</button>
+            </CardHeader>
+            <div className="flex-1 overflow-y-auto p-5 space-y-3 custom-scroll">
+              {historyItems.map(item => (
+                <div key={item.id} className="p-4 border border-slate-100 rounded-2xl bg-white hover:border-indigo-200 transition-all group relative">
+                  <p className="text-xs text-slate-600 line-clamp-2 mb-3 font-bold pr-6">{item.prompt}</p>
+                  <button 
+                    onClick={() => { setQuery(item.prompt); void runAiGeneration(item.prompt); }} 
+                    className="text-[10px] font-black text-indigo-500 hover:text-indigo-800 uppercase tracking-tighter"
+                  >Vẽ lại ngay</button>
+                </div>
+              ))}
+            </div>
+          </Card>
+        </aside>
+
+        <main className="flex flex-col gap-8">
+          <div className="bg-white rounded-[3rem] shadow-2xl border-[12px] border-white overflow-hidden relative min-h-[720px] ring-1 ring-slate-200">
+            <div ref={appletContainerRef} className="w-full h-[720px] bg-slate-50" />
+            {!scriptReady && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/95 z-50">
+                <div className="h-20 w-20 border-8 border-slate-100 border-t-indigo-600 rounded-full animate-spin" />
+                <p className="mt-6 text-[10px] font-black text-slate-400 uppercase tracking-[0.4em]">Engine Loading...</p>
+              </div>
+            )}
+          </div>
+          
+          <div className="bg-slate-900 text-white p-5 rounded-[2.5rem] flex flex-col md:flex-row justify-between items-center gap-6 shadow-2xl border border-slate-800">
+            <div className="flex items-center gap-5">
+              <div className="bg-slate-800 p-3 rounded-2xl text-indigo-400 shadow-inner">
+                <Settings2 className="h-6 w-6" />
+              </div>
+              <div className="flex flex-col">
+                <span className="text-[10px] font-black uppercase text-slate-500 tracking-widest mb-1">Status Report</span>
+                <span className="text-sm font-bold text-slate-200 line-clamp-1 italic tracking-tight">{lastSummary}</span>
+              </div>
+            </div>
+            <div className="flex gap-3 shrink-0">
+              <button 
+                onClick={initApplet}
+                className="bg-slate-800 hover:bg-slate-700 text-slate-300 px-6 py-3 rounded-2xl text-xs font-black transition-all flex items-center gap-3 active:scale-95"
+              >
+                <Grid3X3 className="h-4 w-4" /> RESET VIEW
+              </button>
+              <button 
+                onClick={() => {
+                  const api = window.ggbApplet;
+                  if (api) { api.newConstruction(); api.evalCommand("ShowAxes[true]"); setLastSummary("Bảng vẽ đã được làm sạch."); }
+                }} 
+                className="bg-indigo-600 hover:bg-red-500 text-white px-8 py-3 rounded-2xl text-xs font-black shadow-lg transition-all active:scale-95"
+              >
+                XÓA TRẮNG
+              </button>
+            </div>
+          </div>
+        </main>
+      </div>
+      
+      <style>{`
+        .custom-scroll::-webkit-scrollbar { width: 6px; }
+        .custom-scroll::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
+      `}</style>
+    </div>
+  );
+}
